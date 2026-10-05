@@ -1,0 +1,221 @@
+import fs from 'fs';
+import path from 'path';
+import { NextResponse } from 'next/server';
+import { verifyToken } from '@/lib/auth';
+import sharp from 'sharp';
+import { revalidatePath } from 'next/cache'; // 👈 Ye add kiya cache clear karne ke liye
+
+// Absolute paths for VPS
+let APPS_FILE = '/root/allyonomax/lib/apps.json';
+let PUBLIC_ROOT = '/root/allyonomax/public'; 
+
+ if (!fs.existsSync(APPS_FILE)) {
+      APPS_FILE = path.join(process.cwd(), 'lib/apps.json');
+    }
+    if(!fs.existsSync(PUBLIC_ROOT)){
+        PUBLIC_ROOT = path.join(process.cwd(), 'public');
+    }
+// const APPS_FILE = path.join(process.cwd(), 'lib/apps.json');
+// const PUBLIC_ROOT = path.join(process.cwd(), 'public');
+function readApps() {
+  const data = fs.readFileSync(APPS_FILE, 'utf8');
+  return JSON.parse(data);
+}
+
+function writeApps(apps) {
+  fs.writeFileSync(APPS_FILE, JSON.stringify(apps, null, 2));
+}
+
+function checkAuth(request) {
+  const token = request.cookies.get('admin_token')?.value;
+  return verifyToken(token);
+}
+
+// ─── GET: List all apps ───
+export async function GET(request) {
+  if (!checkAuth(request)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  try {
+    const apps = readApps();
+    return NextResponse.json({ success: true, apps });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+}
+
+// ─── POST: Add new app ───
+export async function POST(request) {
+  if (!checkAuth(request)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  try {
+    const newApp = await request.json();
+    const apps = readApps();
+
+    const newId = apps.length > 0 ? Math.max(...apps.map(a => a.id || 0)) + 1 : 1;
+    newApp.id = newId;
+    newApp.lastModified = new Date().toISOString(); // for sitemap freshness signal
+
+    if (!newApp.slug) {
+      newApp.slug = newApp.name.toLowerCase().replace(/ /g, '-').replace(/[^a-z0-9-]/g, '');
+    }
+
+    let domain = '';
+    if (newApp.referLink && newApp.referLink.trim()) {
+      try {
+        let url = newApp.referLink.trim();
+        if (!url.startsWith('http')) url = 'https://' + url;
+        domain = new URL(url).hostname;
+      } catch {}
+    }
+
+    if (domain) {
+      const logoPaths = ['/logo.png', '/logo.jpg', '/logo.webp', '/favicon.ico', '/apple-touch-icon.png', '/android-chrome-512x512.png'];
+      let logoBuffer = null;
+
+      for (const lp of logoPaths) {
+        try {
+          const res = await fetch(`https://${domain}${lp}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+          if (res.ok) {
+            const ct = res.headers.get('content-type');
+            if (ct && ct.startsWith('image/')) {
+              logoBuffer = await res.arrayBuffer();
+              break;
+            }
+          }
+        } catch {}
+      }
+
+      if (logoBuffer) {
+        const webp = await sharp(Buffer.from(logoBuffer)).resize(200, 200, { fit: 'inside' }).webp({ quality: 85 }).toBuffer();
+        const iconsDir = path.join(PUBLIC_ROOT, 'icons');
+        if (!fs.existsSync(iconsDir)) fs.mkdirSync(iconsDir, { recursive: true });
+        const imgName = `${newApp.slug}.webp`;
+        fs.writeFileSync(path.join(iconsDir, imgName), webp);
+        newApp.icon = `/icons/${imgName}`;
+      } else {
+        newApp.icon = '';
+      }
+    } else {
+      newApp.icon = '';
+    }
+
+    const pos = newApp.position;
+    delete newApp.position;
+
+    if (pos && !isNaN(parseInt(pos, 10))) {
+      let insertIndex = parseInt(pos, 10) - 1;
+      if (insertIndex < 0) insertIndex = 0;
+      if (insertIndex > apps.length) insertIndex = apps.length;
+      apps.splice(insertIndex, 0, newApp);
+    } else {
+      apps.push(newApp);
+    }
+
+    writeApps(apps);
+
+    // ISR: revalidate home page + the new app's specific page
+    revalidatePath('/', 'page');
+    revalidatePath(`/${newApp.slug}`, 'page');
+    // Also revalidate sitemap so new app appears in Google index submission
+    revalidatePath('/sitemap.xml');
+
+    return NextResponse.json({ success: true, id: newId, icon: newApp.icon });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+}
+
+// ─── PUT: Update an app ───
+export async function PUT(request) {
+  if (!checkAuth(request)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  try {
+    const data = await request.json();
+    const apps = readApps();
+
+    if (data.action === 'reorder') {
+      const { id, newPosition } = data;
+      const index = apps.findIndex(a => a.id === id);
+      if (index === -1) {
+        return NextResponse.json({ success: false, error: 'App not found' }, { status: 404 });
+      }
+      
+      const appToMove = apps[index];
+      apps.splice(index, 1);
+      
+      let newIndex = parseInt(newPosition, 10) - 1;
+      if (isNaN(newIndex) || newIndex < 0) newIndex = 0;
+      if (newIndex > apps.length) newIndex = apps.length;
+      
+      apps.splice(newIndex, 0, appToMove);
+      writeApps(apps);
+      
+      revalidatePath('/', 'page');
+      revalidatePath('/all-yono-games', 'page');
+      revalidatePath(`/${appToMove.slug}`, 'page');
+      return NextResponse.json({ success: true, app: appToMove });
+    }
+
+    const updatedApp = data;
+    const index = apps.findIndex(a => a.id === updatedApp.id);
+
+    if (index === -1) {
+      return NextResponse.json({ success: false, error: 'App not found' }, { status: 404 });
+    }
+
+    if (!updatedApp.icon) {
+      updatedApp.icon = apps[index].icon || '';
+    }
+
+    apps[index] = { ...apps[index], ...updatedApp, lastModified: new Date().toISOString() };
+    writeApps(apps);
+
+    // ISR: revalidate home + the specific app page that was edited
+    revalidatePath('/', 'page');
+    revalidatePath(`/${apps[index].slug}`, 'page');
+
+    return NextResponse.json({ success: true, app: apps[index] });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+}
+
+// ─── DELETE: Delete an app ───
+export async function DELETE(request) {
+  if (!checkAuth(request)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  try {
+    const { id } = await request.json();
+    const apps = readApps();
+    const index = apps.findIndex(a => a.id === id);
+
+    if (index === -1) {
+      return NextResponse.json({ success: false, error: 'App not found' }, { status: 404 });
+    }
+
+    // const app = apps[index];
+    // if (app.icon) {
+    //   const iconPath = path.join(PUBLIC_ROOT, app.icon);
+    //   if (fs.existsSync(iconPath)) {
+    //     fs.unlinkSync(iconPath);
+    //   }
+    // }
+
+    const deletedSlug = apps[index].slug;
+    apps.splice(index, 1);
+    writeApps(apps);
+
+    // ISR: revalidate home + the deleted page (will serve 404 now)
+    revalidatePath('/', 'page');
+    revalidatePath(`/${deletedSlug}`, 'page');
+    revalidatePath('/sitemap.xml');
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+}
